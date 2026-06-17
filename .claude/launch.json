@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "html-translator-web",
+      "runtimeExecutable": "C:\\Users\\Poojan Sahil\\AppData\\Local\\Python\\bin\\python3.exe",
+      "runtimeArgs": ["-m", "uvicorn", "main:app", "--reload", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}
