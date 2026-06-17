@@ -293,32 +293,62 @@
     const btn = document.getElementById('auto-btn');
     btn.disabled = true;
     hideAlert('auto-alert');
-    setProgress('auto-bar','auto-progress','auto-msg', 5, 'Uploading and translating — this may take a minute...');
+    setProgress('auto-bar', 'auto-progress', 'auto-msg', 2, 'Uploading file...');
 
-    // Animate bar while waiting (we don't get real progress from the server)
-    let pct = 5;
-    const ticker = setInterval(() => {
-      pct = Math.min(pct + 2, 90);
-      document.getElementById('auto-bar').style.width = pct + '%';
-    }, 1500);
+    // Upload via fetch first, then switch to SSE for progress
+    const fd = new FormData();
+    fd.append('file', file);
 
     try {
-      const fd = new FormData();
-      fd.append('file', file);
       const resp = await fetch('/auto-translate', { method: 'POST', body: fd });
-      clearInterval(ticker);
       if (!resp.ok) {
-        const err = await resp.json().catch(() => ({detail: 'Unknown error'}));
+        const err = await resp.json().catch(() => ({detail: resp.statusText}));
         throw new Error(err.detail || resp.statusText);
       }
-      setProgress('auto-bar','auto-progress','auto-msg', 100, 'Done!');
-      const blob = await resp.blob();
-      const stem = file.name.replace(/\.html$/i, '');
-      triggerDownload(blob, stem + '_Telugu.html');
-      showAlert('auto-alert', '✓ Telugu HTML downloaded successfully!', 'success');
+
+      // Read SSE stream from the response body
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse complete SSE messages (separated by \n\n)
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();   // last part may be incomplete
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+          const msg = JSON.parse(line.slice(5).trim());
+
+          if (msg.type === 'start') {
+            setProgress('auto-bar', 'auto-progress', 'auto-msg', 2,
+              `Translating 0 of ${msg.total} strings...`);
+
+          } else if (msg.type === 'progress') {
+            setProgress('auto-bar', 'auto-progress', 'auto-msg', msg.pct,
+              `Translating ${msg.done} of ${msg.total} strings...`);
+
+          } else if (msg.type === 'complete') {
+            setProgress('auto-bar', 'auto-progress', 'auto-msg', 100, 'Done!');
+            // msg.html is the full Telugu HTML — download it as a file
+            const blob = new Blob([msg.html], { type: 'text/html' });
+            triggerDownload(blob, msg.filename);
+            showAlert('auto-alert', '✓ Telugu HTML downloaded successfully!', 'success');
+            btn.disabled = false;
+            return;
+
+          } else if (msg.type === 'error') {
+            throw new Error(msg.message);
+          }
+        }
+      }
     } catch (e) {
-      clearInterval(ticker);
-      setProgress('auto-bar','auto-progress','auto-msg', -1, '');
+      setProgress('auto-bar', 'auto-progress', 'auto-msg', -1, '');
       showAlert('auto-alert', '✗ ' + e.message, 'error');
     } finally {
       btn.disabled = false;

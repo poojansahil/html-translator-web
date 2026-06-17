@@ -1,13 +1,15 @@
 import os
+import json
 import asyncio
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from translator import extract_to_excel, load_translations_from_bytes, apply_translations, walk_dom, strip_emoji, should_extract
-from hf_translate import translate_text, translate_batch
+from translator import (extract_to_excel, load_translations_from_bytes,
+                        apply_translations, walk_dom, strip_emoji)
+from hf_translate import translate_batch
 from bs4 import BeautifulSoup
 
 app = FastAPI(title='HTML Translator')
@@ -22,7 +24,7 @@ app.add_middleware(
 
 @app.post('/extract')
 async def extract(file: UploadFile = File(...)):
-    """Upload an HTML file → download a filled Excel template."""
+    """Upload HTML → download Excel template."""
     if not file.filename.endswith('.html'):
         raise HTTPException(400, 'Please upload an .html file')
     html = (await file.read()).decode('utf-8', errors='replace')
@@ -37,38 +39,69 @@ async def extract(file: UploadFile = File(...)):
 
 @app.post('/auto-translate')
 async def auto_translate(file: UploadFile = File(...)):
-    """Upload an HTML file → auto-translate to Telugu → download Telugu HTML."""
+    """
+    Upload HTML → stream SSE progress events → final event contains
+    a data-URL of the Telugu HTML so the browser can download it.
+    """
     if not file.filename.endswith('.html'):
         raise HTTPException(400, 'Please upload an .html file')
     html = (await file.read()).decode('utf-8', errors='replace')
+    stem = Path(file.filename).stem
 
-    # Extract all English strings
     soup = BeautifulSoup(html, 'html.parser')
     records = list(walk_dom(soup))
     if not records:
         raise HTTPException(400, 'No translatable text found in this HTML file')
 
-    # Translate each string
-    texts_to_translate = [strip_emoji(text) for _, _, _, text in records]
-    try:
-        translated = await asyncio.to_thread(translate_batch, texts_to_translate)
-    except Exception as e:
-        raise HTTPException(502, f'Translation service error: {e}')
+    texts = [strip_emoji(text) for _, _, _, text in records]
+    total = len(texts)
 
-    # Build translations dict (index → telugu) and english_check (index → original)
-    translations = {}
-    english_check = {}
-    for (idx, _, _, original), telugu in zip(records, translated):
-        translations[idx] = telugu
-        english_check[idx] = original
+    async def event_stream():
+        translated_results = {}
+        error_holder = {}
 
-    new_html, applied, total = apply_translations(html, translations, english_check)
-    stem = Path(file.filename).stem
-    return Response(
-        content=new_html.encode('utf-8'),
-        media_type='text/html; charset=utf-8',
-        headers={'Content-Disposition': f'attachment; filename="{stem}_Telugu.html"'}
-    )
+        # Progress callback runs in the thread — queues events via asyncio
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        def progress_cb(done, total):
+            pct = int(done / total * 100)
+            loop.call_soon_threadsafe(queue.put_nowait, ('progress', done, total, pct))
+
+        def run_translation():
+            try:
+                results = translate_batch(texts, progress_cb=progress_cb)
+                loop.call_soon_threadsafe(queue.put_nowait, ('done', results))
+            except Exception as e:
+                loop.call_soon_threadsafe(queue.put_nowait, ('error', str(e)))
+
+        # Start translation in background thread
+        asyncio.get_event_loop().run_in_executor(None, run_translation)
+
+        yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
+
+        while True:
+            msg = await queue.get()
+            if msg[0] == 'progress':
+                _, done, tot, pct = msg
+                yield f"data: {json.dumps({'type': 'progress', 'done': done, 'total': tot, 'pct': pct})}\n\n"
+            elif msg[0] == 'done':
+                translated = msg[1]
+                # Build translations dict and apply
+                translations = {}
+                english_check = {}
+                for (idx, _, _, original), telugu in zip(records, translated):
+                    translations[idx] = telugu
+                    english_check[idx] = original
+                new_html, applied, _ = apply_translations(html, translations, english_check)
+                yield f"data: {json.dumps({'type': 'complete', 'html': new_html, 'filename': stem + '_Telugu.html'})}\n\n"
+                break
+            elif msg[0] == 'error':
+                yield f"data: {json.dumps({'type': 'error', 'message': msg[1]})}\n\n"
+                break
+
+    return StreamingResponse(event_stream(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 
 @app.post('/apply')
