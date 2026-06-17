@@ -4,3 +4,4 @@ python-multipart
 beautifulsoup4
 openpyxl
 requests
+deep-translator
