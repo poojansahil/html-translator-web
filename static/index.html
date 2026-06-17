@@ -335,10 +335,14 @@
 
           } else if (msg.type === 'complete') {
             setProgress('auto-bar', 'auto-progress', 'auto-msg', 100, 'Done!');
-            // msg.html is the full Telugu HTML — download it as a file
-            const blob = new Blob([msg.html], { type: 'text/html' });
-            triggerDownload(blob, msg.filename);
-            showAlert('auto-alert', '✓ Telugu HTML downloaded successfully!', 'success');
+            // Server stored the file — just navigate to the download URL
+            const a = document.createElement('a');
+            a.href = msg.url;
+            a.download = msg.filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            showAlert('auto-alert', '✓ Telugu HTML downloaded! Check your Downloads folder.', 'success');
             btn.disabled = false;
             return;
 

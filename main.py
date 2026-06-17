@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import asyncio
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -21,6 +22,10 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
+# In-memory store: job_id → (filename, html_bytes)
+# Render free tier is single-worker so this is safe
+_results: dict[str, tuple[str, bytes]] = {}
+
 
 @app.post('/extract')
 async def extract(file: UploadFile = File(...)):
@@ -39,14 +44,12 @@ async def extract(file: UploadFile = File(...)):
 
 @app.post('/auto-translate')
 async def auto_translate(file: UploadFile = File(...)):
-    """
-    Upload HTML → stream SSE progress events → final event contains
-    a data-URL of the Telugu HTML so the browser can download it.
-    """
+    """Stream SSE progress; on completion store result and return download URL."""
     if not file.filename.endswith('.html'):
         raise HTTPException(400, 'Please upload an .html file')
     html = (await file.read()).decode('utf-8', errors='replace')
     stem = Path(file.filename).stem
+    out_filename = stem + '_Telugu.html'
 
     soup = BeautifulSoup(html, 'html.parser')
     records = list(walk_dom(soup))
@@ -57,16 +60,12 @@ async def auto_translate(file: UploadFile = File(...)):
     total = len(texts)
 
     async def event_stream():
-        translated_results = {}
-        error_holder = {}
-
-        # Progress callback runs in the thread — queues events via asyncio
         loop = asyncio.get_event_loop()
         queue = asyncio.Queue()
 
-        def progress_cb(done, total):
-            pct = int(done / total * 100)
-            loop.call_soon_threadsafe(queue.put_nowait, ('progress', done, total, pct))
+        def progress_cb(done, tot):
+            pct = int(done / tot * 100)
+            loop.call_soon_threadsafe(queue.put_nowait, ('progress', done, tot, pct))
 
         def run_translation():
             try:
@@ -75,9 +74,7 @@ async def auto_translate(file: UploadFile = File(...)):
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ('error', str(e)))
 
-        # Start translation in background thread
-        asyncio.get_event_loop().run_in_executor(None, run_translation)
-
+        loop.run_in_executor(None, run_translation)
         yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
 
         while True:
@@ -85,23 +82,42 @@ async def auto_translate(file: UploadFile = File(...)):
             if msg[0] == 'progress':
                 _, done, tot, pct = msg
                 yield f"data: {json.dumps({'type': 'progress', 'done': done, 'total': tot, 'pct': pct})}\n\n"
+
             elif msg[0] == 'done':
                 translated = msg[1]
-                # Build translations dict and apply
                 translations = {}
                 english_check = {}
                 for (idx, _, _, original), telugu in zip(records, translated):
                     translations[idx] = telugu
                     english_check[idx] = original
-                new_html, applied, _ = apply_translations(html, translations, english_check)
-                yield f"data: {json.dumps({'type': 'complete', 'html': new_html, 'filename': stem + '_Telugu.html'})}\n\n"
+                new_html, _, _ = apply_translations(html, translations, english_check)
+
+                # Store result, hand browser a clean download URL
+                job_id = str(uuid.uuid4())
+                _results[job_id] = (out_filename, new_html.encode('utf-8'))
+                yield f"data: {json.dumps({'type': 'complete', 'url': f'/download/{job_id}', 'filename': out_filename})}\n\n"
                 break
+
             elif msg[0] == 'error':
                 yield f"data: {json.dumps({'type': 'error', 'message': msg[1]})}\n\n"
                 break
 
     return StreamingResponse(event_stream(), media_type='text/event-stream',
                              headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.get('/download/{job_id}')
+async def download(job_id: str):
+    """Return the stored translated HTML file for download."""
+    entry = _results.pop(job_id, None)   # pop — one-time download, cleans up memory
+    if not entry:
+        raise HTTPException(404, 'File not found or already downloaded')
+    filename, content = entry
+    return Response(
+        content=content,
+        media_type='text/html; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
 
 
 @app.post('/apply')
@@ -126,7 +142,7 @@ async def apply(
     if not translations:
         raise HTTPException(400, 'No translations found in the Excel file — fill column F first')
 
-    new_html, applied, total = apply_translations(html, translations, english_check)
+    new_html, _, _ = apply_translations(html, translations, english_check)
     stem = Path(html_file.filename).stem
     return Response(
         content=new_html.encode('utf-8'),
@@ -135,6 +151,5 @@ async def apply(
     )
 
 
-# Serve the frontend
 static_dir = Path(__file__).parent / 'static'
 app.mount('/', StaticFiles(directory=str(static_dir), html=True), name='static')
